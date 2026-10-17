@@ -152,7 +152,7 @@ Inicie a aplicação:
 python pythomic.py
 ```
 
-Acesse **http://127.0.0.1:5000** no navegador. Para parar o servidor, pressione `Ctrl+C`. Para sair do ambiente virtual, execute:
+Acesse **http://localhost:5000** no navegador. Para parar o servidor, pressione `Ctrl+C`. Para sair do ambiente virtual, execute:
 
 ```bash
 deactivate
