@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pythomic_secret
+.env
+database.db
+uploads/
