@@ -98,7 +98,7 @@ py pythomic.py
 
 Abra o navegador em:
 
-**http://127.0.0.1:5000**
+**http://localhost:5000**
 
 Para sair, pressione `Ctrl+C` no terminal. Para sair do ambiente virtual, execute `deactivate`.
 
@@ -198,7 +198,7 @@ Não force a instalação de pacotes no Python do sistema. Crie e ative o ambien
 
 ### Não consigo abrir a página
 
-Confirme que o servidor continua em execução e que o terminal não mostrou um erro. Abra `http://127.0.0.1:5000` no mesmo computador. Por padrão, o endereço local não disponibiliza o site publicamente na rede.
+Confirme que o servidor continua em execução e que o terminal não mostrou um erro. Abra `http://localhost:5000` no mesmo computador. Por padrão, o endereço local não disponibiliza o site publicamente na rede.
 
 ## Segurança
 
