@@ -386,6 +386,14 @@ def init_db():
                 post_id INTEGER NOT NULL,
                 PRIMARY KEY (user_id, post_id))"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS post_views (
+                post_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                viewed_at INTEGER NOT NULL,
+                PRIMARY KEY (post_id, user_id),
+                FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_likes_post ON likes(post_id)")
@@ -408,6 +416,7 @@ def safe_user(row):
         "name": decrypt_field(row["name_enc"]) or "Usuário",
         "email": decrypt_field(row["email_enc"]),
         "profile_pic": row["profile_pic"] or DEFAULT_AVATAR,
+        "created": row["created_at"],
     }
 
 
@@ -474,7 +483,11 @@ def update_password(user_id, new_password):
 
 
 def get_user_stats(user_id):
-    """Retorna {"followers": n, "following": n} do usuário (2 consultas indexadas)."""
+    """Estatísticas do usuário: seguidores, seguindo, posts e views acumuladas.
+
+    As views somam TODAS as visualizações únicas recebidas pelos posts do
+    usuário (uma por usuário por post — veja a tabela post_views).
+    """
     with _conn() as conn:
         seguidores = conn.execute(
             "SELECT COUNT(*) AS total FROM followers WHERE following_id = ?", (user_id,)
@@ -482,7 +495,31 @@ def get_user_stats(user_id):
         seguindo = conn.execute(
             "SELECT COUNT(*) AS total FROM followers WHERE follower_id = ?", (user_id,)
         ).fetchone()["total"]
-    return {"followers": seguidores, "following": seguindo}
+        posts = conn.execute(
+            "SELECT COUNT(*) AS total FROM posts WHERE user_id = ?", (user_id,)
+        ).fetchone()["total"]
+        views = conn.execute(
+            "SELECT COUNT(*) AS total FROM post_views v JOIN posts p ON p.id = v.post_id"
+            " WHERE p.user_id = ?",
+            (user_id,),
+        ).fetchone()["total"]
+    return {"followers": seguidores, "following": seguindo, "posts": posts, "views": views}
+
+
+def is_following(follower_id, following_id) -> bool:
+    """Verifica se follower_id já segue following_id (consulta indexada)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM followers WHERE follower_id = ? AND following_id = ?",
+            (follower_id, following_id),
+        ).fetchone()
+    return row is not None
+
+
+def update_profile_pic(user_id, pic_path) -> None:
+    """Grava o novo caminho da foto de perfil (arquivo servido por /uploads)."""
+    with _conn() as conn:
+        conn.execute("UPDATE users SET profile_pic = ? WHERE id = ?", (pic_path, user_id))
 
 
 def toggle_follow(follower_id, following_id):
@@ -545,6 +582,15 @@ def get_all_posts(current_user_id):
     na memória do servidor, já no formato pronto para a interface.
     """
     with _conn() as conn:
+        # Contagem de views: registra a visualização ÚNICA deste usuário para
+        # cada post de OUTRAS pessoas presente no feed. O INSERT OR IGNORE
+        # garante uma view por usuário por post — atualizar o feed não infla
+        # o contador (e o próprio autor não contabiliza view nele mesmo).
+        conn.execute(
+            "INSERT OR IGNORE INTO post_views (post_id, user_id, viewed_at) "
+            "SELECT p.id, ?, ? FROM posts p WHERE p.user_id != ?",
+            (current_user_id, int(time.time()), current_user_id),
+        )
         rows = conn.execute(
             """
             SELECT
@@ -553,7 +599,8 @@ def get_all_posts(current_user_id):
                 (SELECT COUNT(*) FROM likes WHERE post_id = p.id)                                 AS likes_count,
                 EXISTS (SELECT 1 FROM likes WHERE post_id = p.id AND user_id = ?)                 AS is_liked,
                 EXISTS (SELECT 1 FROM followers WHERE follower_id = ? AND following_id = p.user_id) AS is_following,
-                (SELECT COUNT(*) FROM followers WHERE following_id = p.user_id)                   AS followers_count
+                (SELECT COUNT(*) FROM followers WHERE following_id = p.user_id)                   AS followers_count,
+                (SELECT COUNT(*) FROM post_views WHERE post_id = p.id)                            AS views_count
             FROM posts p
             JOIN users u ON u.id = p.user_id
             ORDER BY p.id DESC
@@ -575,6 +622,7 @@ def get_all_posts(current_user_id):
                 "is_liked": bool(r["is_liked"]),
                 "is_following": bool(r["is_following"]),
                 "followers_count": r["followers_count"],
+                "views_count": r["views_count"],
             }
         )
     return feed
@@ -617,12 +665,13 @@ def _magic_mime(data: bytes):
     return None
 
 
-def save_media(base64_data, filename_prefix) -> str:
+def save_media(base64_data, filename_prefix, images_only=False) -> str:
     """Valida e grava a mídia enviada (data URL em base64).
 
     Validações: tipo declarado x magic bytes, tamanho máximo (10 MB) e
     decodificação base64 estrita. O arquivo é salvo com nome aleatório
     (uuid4) para evitar colisões e caminhos previsíveis.
+    Com images_only=True (foto de perfil), vídeos são rejeitados.
     Retorna o caminho público "/uploads/<arquivo>".
     """
     if not base64_data:
@@ -648,6 +697,8 @@ def save_media(base64_data, filename_prefix) -> str:
     real = _magic_mime(data)
     if real is None:
         raise UploadError("Tipo de arquivo não permitido (use JPG, PNG, GIF, WEBP ou MP4).")
+    if images_only and not real.startswith("image/"):
+        raise UploadError("A foto de perfil deve ser uma imagem (JPG, PNG, GIF ou WEBP).")
     if declarado and declarado != real:
         # O navegador declarou um tipo, mas a assinatura do arquivo é outra:
         # indício clássico de arquivo disfarçado — rejeite.
@@ -976,6 +1027,7 @@ html[data-theme="dark"] .py-nav-btn:hover { background: rgba(255, 255, 255, 0.08
     gap: 10px;
     border-top: 1px solid var(--border);
     padding-top: 14px;
+    cursor: pointer;
 }
 .py-side-profile-name { font-weight: bold; font-size: 13px; color: var(--text); }
 .py-side-profile-meta { font-size: 11px; color: var(--muted); }
@@ -1014,7 +1066,7 @@ html[data-theme="dark"] .py-nav-btn:hover { background: rgba(255, 255, 255, 0.08
     justify-content: space-between;
     padding: 10px 14px;
 }
-.py-post-user { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.py-post-user { display: flex; align-items: center; gap: 10px; min-width: 0; cursor: pointer; }
 .py-avatar {
     width: 42px;
     height: 42px;
@@ -1142,8 +1194,37 @@ html[data-theme="dark"] .py-like-btn:hover { background: rgba(255, 255, 255, 0.0
 }
 .py-stat strong { color: var(--text); }
 
-/* ---- Desktop (>= 1024px): barra lateral fixa à esquerda, abas escondidas ---- */
-@media (min-width: 1024px) {
+/* ---- Views, foto de perfil e modal de perfil ---- */
+.py-views {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+}
+.py-avatar-wrap { display: flex; justify-content: center; margin: 0 0 6px; }
+.py-avatar-lg { width: 84px; height: 84px; }
+.py-profile-row { display: flex; align-items: center; gap: 14px; margin: 4px 0 10px; }
+.py-profile-row .py-avatar { width: 72px; height: 72px; }
+.py-profile-info { min-width: 0; flex: 1; }
+.py-profile-name {
+    font-weight: bold;
+    font-size: 17px;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.py-profile-meta { font-size: 12px; color: var(--muted); }
+
+/* ---- Desktop / tela na horizontal: barra lateral fixa à esquerda, abas
+   escondidas. Além do corte clássico de 1024px, o modo paisagem
+   (orientation: landscape) com pelo menos 740px de largura TAMBÉM ativa a
+   barra lateral — assim a barra de abas do canto inferior some quando o
+   monitor está na horizontal, sem deixar o usuário sem navegação. ---- */
+@media (min-width: 1024px), (orientation: landscape) and (min-width: 740px) {
     .py-header { display: none; }
     .py-tabs { display: none; }
     .py-sidebar { display: flex; }
@@ -1193,10 +1274,13 @@ def _theme_sync_script(is_dark: bool) -> str:
 # Padrão do projeto mantido: o input de arquivo lê o arquivo como data URL
 # (base64) e despeja num input escondido, cujo evento "input" chega ao
 # servidor. Melhorias: valida o tamanho (10 MB) no cliente com mensagem
-# em pt-BR antes de ler, e trata falhas de leitura.
-FILE_UPLOAD_SCRIPT = """
+# em pt-BR antes de ler, e trata falhas de leitura. A função abaixo gera uma
+# cópia do script para cada par de ids (mídia do post e foto de perfil).
+def _make_upload_script(file_input_id: str, hidden_input_id: str) -> str:
+    """Gera o script de upload para um par (input de arquivo, input escondido)."""
+    return """
 (function () {
-    var fileInput = document.getElementById('py_file_input');
+    var fileInput = document.getElementById('FILE_INPUT_ID');
     if (!fileInput || fileInput.dataset.pyBound) return;
     fileInput.dataset.pyBound = '1';
     fileInput.addEventListener('change', function (e) {
@@ -1210,7 +1294,7 @@ FILE_UPLOAD_SCRIPT = """
         }
         var reader = new FileReader();
         reader.onload = function (ev) {
-            var hidden = document.getElementById('py_base64_input');
+            var hidden = document.getElementById('HIDDEN_INPUT_ID');
             if (!hidden) return;
             hidden.value = ev.target.result;
             hidden.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1221,7 +1305,14 @@ FILE_UPLOAD_SCRIPT = """
         reader.readAsDataURL(file);
     });
 })();
-"""
+""".replace("FILE_INPUT_ID", file_input_id).replace("HIDDEN_INPUT_ID", hidden_input_id)
+
+
+# Upload de mídia dos posts (ids originais preservados).
+FILE_UPLOAD_SCRIPT = _make_upload_script("py_file_input", "py_base64_input")
+
+# Upload da foto de perfil (ids próprios, sem colidir com o modal de post).
+AVATAR_UPLOAD_SCRIPT = _make_upload_script("py_avatar_file_input", "py_avatar_b64_input")
 
 
 # --- Ícones em SVG inline (sem emojis na interface) ---
@@ -1278,6 +1369,10 @@ IMAGE_PATHS = (
     "M21 19V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2z",
     "M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z",
     "M21 15l-5-5L5 21",
+)
+CAMERA_PATHS = (
+    "M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z",
+    "M16 13a4 4 0 1 1-8 0 4 4 0 0 1 8 0z",
 )
 
 
@@ -1348,6 +1443,10 @@ def IconDevices(size=20):
 
 def IconImage(size=48):
     return _icon(size, *IMAGE_PATHS)
+
+
+def IconCamera(size=20):
+    return _icon(size, *CAMERA_PATHS)
 
 
 # --- Telas ---
@@ -1531,7 +1630,7 @@ def AuthScreen(set_page, set_user):
 
 
 @component
-def PostCard(post, current_user, refresh, feed_version):
+def PostCard(post, current_user, refresh, feed_version, on_open_profile):
     """Card de post do feed.
 
     Os estados de curtida guardam o id do post e a versão do feed: como os
@@ -1609,7 +1708,11 @@ def PostCard(post, current_user, refresh, feed_version):
         html.div(
             {"class": "py-post-header"},
             html.div(
-                {"class": "py-post-user"},
+                {
+                    "class": "py-post-user",
+                    "on_click": lambda e: on_open_profile(post["user_id"]),
+                    "title": "Ver perfil",
+                },
                 html.div(
                     {"class": "py-avatar"},
                     html.img({"src": post["profile_pic"], "alt": post["name"]}),
@@ -1630,6 +1733,11 @@ def PostCard(post, current_user, refresh, feed_version):
                 html.span({"class": "py-pop", "key": f"heart-{pop_key}"}, HeartIcon(like_state["liked"])),
             ),
             html.span({"class": "py-likes"}, str(like_state["count"])),
+            html.span(
+                {"class": "py-views", "title": "Visualizações"},
+                IconEye(16),
+                str(post["views_count"]),
+            ),
         ),
         legenda,
     )
@@ -1726,8 +1834,8 @@ def CreatePostModal(user, on_close, refresh):
 
 
 @component
-def MenuModal(user, set_user, is_dark, set_is_dark, on_close):
-    """Menu do perfil: estatísticas, troca de senha, tema e logout."""
+def MenuModal(user, set_user, is_dark, set_is_dark, on_close, refresh):
+    """Menu do perfil: foto, estatísticas (+ views), senha, tema e logout."""
     stats = get_user_stats(user["id"])
     old_pwd, set_old_pwd = use_state("")
     new_pwd, set_new_pwd = use_state("")
@@ -1735,11 +1843,38 @@ def MenuModal(user, set_user, is_dark, set_is_dark, on_close):
     pwd_msg, set_pwd_msg = use_state("")
     pwd_ok, set_pwd_ok = use_state(False)
     show_pwd, set_show_pwd = use_state(False)
+    avatar_data, set_avatar_data = use_state(None)
+    avatar_key, set_avatar_key = use_state(0)
+    avatar_msg, set_avatar_msg = use_state("")
+    avatar_ok, set_avatar_ok = use_state(False)
 
     def toggle_theme(e):
         # Troca o estado no servidor; o script de sincronização (keyed)
         # aplica o data-theme no <html> e grava no localStorage.
         set_is_dark(not is_dark)
+
+    def change_avatar(e):
+        """Troca a foto de perfil: valida (somente imagens), grava e atualiza a UI."""
+        set_avatar_msg("")
+        set_avatar_ok(False)
+        if not avatar_data:
+            set_avatar_msg("Escolha uma imagem primeiro.")
+            return
+        try:
+            caminho = save_media(
+                avatar_data, f"avatar_{user['id']}_{int(time.time())}", images_only=True
+            )
+        except UploadError as err:
+            set_avatar_msg(str(err))
+            return
+        update_profile_pic(user["id"], caminho)
+        # safe_user() de novo: a nova foto sai limpa para toda a interface.
+        set_user(safe_user(get_user_by_id(user["id"])))
+        set_avatar_data(None)
+        set_avatar_key(lambda k: k + 1)  # reseta o input de arquivo
+        set_avatar_ok(True)
+        set_avatar_msg("Foto de perfil atualizada!")
+        refresh()  # propaga a nova foto para os cards do feed
 
     def change_password(e):
         set_pwd_msg("")
@@ -1774,6 +1909,45 @@ def MenuModal(user, set_user, is_dark, set_is_dark, on_close):
             ),
             html.h3({"class": "py-modal-title"}, f"@{user['name']}"),
             html.div(
+                {"class": "py-avatar-wrap"},
+                html.div(
+                    {"class": "py-avatar py-avatar-lg"},
+                    html.img({"src": user["profile_pic"], "alt": user["name"]}),
+                ),
+            ),
+            html.input(
+                {
+                    "type": "file",
+                    "id": "py_avatar_file_input",
+                    "key": f"avatar-file-{avatar_key}",
+                    "class": "py-input py-file",
+                    "accept": "image/jpeg,image/png,image/gif,image/webp",
+                }
+            ),
+            html.input(
+                {
+                    "type": "hidden",
+                    "id": "py_avatar_b64_input",
+                    "key": f"avatar-hidden-{avatar_key}",
+                    "on_change": lambda e: set_avatar_data(e["target"]["value"]),
+                }
+            ),
+            html.img(
+                {
+                    "src": avatar_data,
+                    "class": "py-thumb",
+                    "alt": "Pré-visualização da nova foto",
+                }
+            ) if avatar_data and avatar_data.startswith("data:image") else None,
+            html.button(
+                {"class": "py-btn py-btn-primary", "on_click": change_avatar},
+                IconCamera(18),
+                "Salvar Nova Foto",
+            ),
+            html.div(
+                {"class": "py-success" if avatar_ok else "py-error"}, avatar_msg
+            ) if avatar_msg else None,
+            html.div(
                 {"class": "py-stats"},
                 html.span(
                     {"class": "py-stat"},
@@ -1784,6 +1958,16 @@ def MenuModal(user, set_user, is_dark, set_is_dark, on_close):
                     {"class": "py-stat"},
                     html.strong({}, str(stats["following"])),
                     " seguindo",
+                ),
+                html.span(
+                    {"class": "py-stat"},
+                    html.strong({}, str(stats["posts"])),
+                    " posts",
+                ),
+                html.span(
+                    {"class": "py-stat"},
+                    html.strong({}, str(stats["views"])),
+                    " views",
                 ),
             ),
             html.hr({"class": "py-divider"}),
@@ -1848,6 +2032,96 @@ def MenuModal(user, set_user, is_dark, set_is_dark, on_close):
                 IconLogout(18),
                 "Sair da Conta",
             ),
+            # Religa o listener do input de arquivo da foto: a key muda junto
+            # com avatar_key e o script é remontado a cada reset (mesmo padrão
+            # do modal de criação de post).
+            html.script({"key": f"avatar-script-{avatar_key}"}, AVATAR_UPLOAD_SCRIPT),
+        ),
+    )
+
+
+@component
+def ProfileModal(current_user, profile_id, on_close, refresh):
+    """Perfil de um usuário: foto, estatísticas e botão Seguir ao lado.
+
+    Abre ao clicar no perfil (avatar/nome) de qualquer card do feed. O botão
+    Seguir/Seguindo fica AO LADO do perfil, como no Instagram; no próprio
+    perfil ele não aparece — ficam só as estatísticas.
+    """
+    dados = safe_user(get_user_by_id(profile_id)) if profile_id else None
+    stats = get_user_stats(profile_id) if profile_id else None
+    seguindo, set_seguindo = use_state(
+        is_following(current_user["id"], profile_id) if profile_id else False
+    )
+    seguidores, set_seguidores = use_state(stats["followers"] if stats else 0)
+
+    def toggle_follow_click(e):
+        agora_segue = toggle_follow(current_user["id"], profile_id)
+        set_seguindo(agora_segue)
+        set_seguidores(lambda n: n + (1 if agora_segue else -1))
+        refresh()  # mantém os botões "Seguir" dos cards em sincronia
+
+    if dados is None or stats is None:
+        return html.div(
+            {"class": "py-overlay", "on_click": on_close},
+            html.div(
+                {"class": "py-modal", "on_click": event(lambda e: None, stop_propagation=True)},
+                html.button(
+                    {"class": "py-icon-btn py-modal-close", "on_click": on_close,
+                     "title": "Fechar"},
+                    IconClose(20),
+                ),
+                html.p({"class": "py-modal-sub"}, "Perfil não encontrado."),
+            ),
+        )
+
+    botao_seguir = None
+    if dados["id"] != current_user["id"]:
+        botao_seguir = html.button(
+            {
+                "class": "py-btn-follow py-btn-following" if seguindo else "py-btn-follow",
+                "on_click": toggle_follow_click,
+            },
+            "Seguindo" if seguindo else "Seguir",
+        )
+
+    return html.div(
+        {"class": "py-overlay", "on_click": on_close},
+        html.div(
+            {"class": "py-modal", "on_click": event(lambda e: None, stop_propagation=True)},
+            html.button(
+                {"class": "py-icon-btn py-modal-close", "on_click": on_close, "title": "Fechar"},
+                IconClose(20),
+            ),
+            html.h3({"class": "py-modal-title"}, "Perfil"),
+            html.div(
+                {"class": "py-profile-row"},
+                html.div(
+                    {"class": "py-avatar"},
+                    html.img({"src": dados["profile_pic"], "alt": dados["name"]}),
+                ),
+                html.div(
+                    {"class": "py-profile-info"},
+                    html.div({"class": "py-profile-name"}, dados["name"]),
+                    html.div(
+                        {"class": "py-profile-meta"},
+                        "Membro desde "
+                        + time.strftime("%d/%m/%Y", time.localtime(dados.get("created") or 0)),
+                    ),
+                ),
+                botao_seguir,
+            ),
+            html.div(
+                {"class": "py-stats"},
+                html.span({"class": "py-stat"}, html.strong({}, str(stats["posts"])), " posts"),
+                html.span(
+                    {"class": "py-stat"}, html.strong({}, str(seguidores)), " seguidores"
+                ),
+                html.span(
+                    {"class": "py-stat"}, html.strong({}, str(stats["following"])), " seguindo"
+                ),
+                html.span({"class": "py-stat"}, html.strong({}, str(stats["views"])), " views"),
+            ),
         ),
     )
 
@@ -1857,6 +2131,7 @@ def HomeScreen(user, set_user, is_dark, set_is_dark):
     """Feed + cabeçalho (mobile), barra lateral (desktop) e abas (mobile)."""
     is_menu_open, set_menu_open = use_state(False)
     is_create_open, set_create_open = use_state(False)
+    profile_id, set_profile_id = use_state(None)
     posts, set_posts = use_state(get_all_posts(user["id"]))
     feed_version, set_feed_version = use_state(0)
     stats = get_user_stats(user["id"])
@@ -1864,6 +2139,9 @@ def HomeScreen(user, set_user, is_dark, set_is_dark):
     def refresh_posts():
         set_posts(get_all_posts(user["id"]))
         set_feed_version(lambda v: v + 1)  # ressincroniza curtidas nos cards
+
+    def open_profile(user_id):
+        set_profile_id(user_id)
 
     def toggle_theme(e):
         set_is_dark(not is_dark)
@@ -1873,6 +2151,14 @@ def HomeScreen(user, set_user, is_dark, set_is_dark):
         html.div({"class": "py-logo py-header-logo"}, "Pythomic"),
         html.div(
             {"style": {"display": "flex", "gap": "2px"}},
+            html.button(
+                {
+                    "class": "py-icon-btn",
+                    "on_click": lambda e: set_create_open(True),
+                    "title": "Criar novo post",
+                },
+                IconPlus(22),
+            ),
             html.button(
                 {
                     "class": "py-icon-btn",
@@ -1901,7 +2187,11 @@ def HomeScreen(user, set_user, is_dark, set_is_dark):
         html.button({"class": "py-nav-btn", "on_click": lambda e: set_user(None)},
                     IconLogout(20), "Sair"),
         html.div(
-            {"class": "py-side-profile"},
+            {
+                "class": "py-side-profile",
+                "on_click": lambda e: set_menu_open(True),
+                "title": "Abrir menu do perfil",
+            },
             html.div(
                 {"class": "py-avatar py-avatar-sm"},
                 html.img({"src": user["profile_pic"], "alt": user["name"]}),
@@ -1953,13 +2243,16 @@ def HomeScreen(user, set_user, is_dark, set_is_dark):
                     "Siga novas pessoas ou publique o primeiro post pelo botão Criar.",
                 ),
             ) if not posts else None,
-            *[PostCard(p, user, refresh_posts, feed_version) for p in posts],
+            *[PostCard(p, user, refresh_posts, feed_version, open_profile) for p in posts],
         ),
         abas,
         CreatePostModal(user, lambda e: set_create_open(False), refresh_posts)
         if is_create_open else None,
-        MenuModal(user, set_user, is_dark, set_is_dark, lambda e: set_menu_open(False))
+        MenuModal(user, set_user, is_dark, set_is_dark,
+                  lambda e: set_menu_open(False), refresh_posts)
         if is_menu_open else None,
+        ProfileModal(user, profile_id, lambda e: set_profile_id(None), refresh_posts)
+        if profile_id else None,
     )
 
 
